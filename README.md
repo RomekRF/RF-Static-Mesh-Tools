@@ -9,7 +9,7 @@ A Blender add-on for importing and exporting Red Faction `.v3m` static meshes an
 
 ## What is this?
 
-Red Faction's `.v3m` format stores static meshes — props, world geometry, vehicles. The `.rfg` format stores brush groups for the RED level editor. Previously the only way to author these was via Volition's 3ds Max plugin, which is decades out of date and not freely available.
+Red Faction's `.v3m` format stores static meshes (props, world geometry, vehicles). The `.rfg` format stores brush groups for the RED level editor. Previously the only way to author these was via Volition's 3ds Max plugin, which is decades out of date and not freely available.
 
 This add-on lets you do both directly in Blender:
 
