@@ -2,7 +2,6 @@
 
 A Blender add-on for importing and exporting Red Faction `.v3m` static meshes and `.rfg` groups — without requiring 3ds Max or any Volition tools.
 
-Built for the [Alpine Faction](https://github.com/GooberRF/alpinefaction) community.
 
 ![Version](https://img.shields.io/badge/version-1.4.5-blue) ![Blender](https://img.shields.io/badge/Blender-4.0--5.0-orange) ![License](https://img.shields.io/badge/license-MIT-green)
 
