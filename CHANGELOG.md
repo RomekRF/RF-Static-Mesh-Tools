@@ -4,6 +4,37 @@ All notable changes to RF Static Mesh Tools.
 
 ---
 
+## v1.4.6 — 2026-05-13
+
+### Fixed
+- **RFG export rewritten to match Redux's on-disk format (RF1 version
+  0x12C).** Previous output was version 98 with several field-layout
+  mismatches; the result wouldn't open in RED or in Redux without
+  corruption. Bug-for-bug audit against Redux's `RfgExporter.cs`,
+  `RfgParser.cs`, and `RFGeometryParser.cs`:
+  - Version bumped from `98` → `0x12C` (300, Alpine Faction RF1).
+  - File header now writes the missing `num_groups` (i32) field after
+    version. Without it, the parser was reading the VString length out
+    of what should have been the group count.
+  - Brush geometry-body prefix changed from `VString + u32 unk_mod`
+    (pre-0xC8 layout) to `2× u32 zero + VString` (the modern layout
+    that version 0x12C requires).
+  - Every face now writes its plane (normal 3f + dist f32, 16 bytes)
+    before the face header. The old comment "RED doesn't include
+    planes — Redux adds those" was incorrect: RED's parser reads
+    those 16 bytes unconditionally and was skipping into the next
+    record's fields.
+  - Removed the spurious `num_old_face_scroll = 0` write after
+    `num_surfaces`. That block only exists for version <= 0xB4.
+  - Trailing section count corrected from 19 → 21 (added
+    `eax_effects` and one more that were missing). These are the 21
+    `RflUtils.Skip*()` calls in `RfgParser.ReadRfg`'s group loop.
+- Face plane is computed with a Newell-style accumulated cross product
+  on the (already winding-reversed) RF-space indices, matching the
+  exact formula Redux uses in `WriteBrushesSection`.
+
+---
+
 ## v1.4.5 — 2026-05-08
 
 ### Fixed

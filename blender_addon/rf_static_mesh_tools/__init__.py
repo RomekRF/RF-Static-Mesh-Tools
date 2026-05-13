@@ -1,7 +1,7 @@
 bl_info = {
     "name": "RF Static Mesh Tools",
     "author": "Romek",
-    "version": (1, 4, 5),
+    "version": (1, 4, 6),
     "blender": (4, 0, 0),
     "location": "File > Import/Export | Sidebar > RF Static",
     "description": "Import and export Red Faction V3M static meshes and RFG groups",
@@ -1027,39 +1027,82 @@ class RFSTATIC_PT_Panel(bpy.types.Panel):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  RFG (Red Faction Group) Writer — matches RED editor .rfg format (ver 98)
+#  RFG (Red Faction Group) Writer — matches Redux RfgExporter output (ver 0x12C)
 # ─────────────────────────────────────────────────────────────────────────────
 #
-#  Format (verified by byte-for-byte parsing of stock RED exports):
+#  Format verified against Redux's RfgExporter.cs + RfgParser.cs +
+#  RFGeometryParser.cs (the canonical Alpine Faction tool):
 #
-#  HEADER:     magic(u32 0xD43DD00D) + version(i32 98)
-#  GROUP:      VString(name) + is_moving(u8 0)
-#  BRUSHES:    count(i32) + brush data ...
-#  TRAILING:   19 section counts (all zero for geometry-only groups)
+#  FILE HEADER:
+#     magic        u32   0xD43DD00D
+#     version      i32   0x0000012C   (300 — Alpine Faction RF1 format)
+#     num_groups   i32   1            (one static group)
 #
-#  Each brush:
-#    uid(i32)  position(3f)  rotation(9f, 3×3 row-major)
-#    VString(geo_name, "")  unk_mod(u32 0)
-#    ntextures(i32) + VString[] textures
-#    nunk_scroll(i32 0)   nrooms(i32 0)   nportals(i32 0)
-#    nverts(i32) + verts(3f each)
-#    nfaces(i32) + faces ...
-#    nsurfaces(i32 0)   nold_scroll(i32 0)
-#    flags(u32)  life(i32)  state(i32)
+#  PER GROUP:
+#     name         VString
+#     is_moving    u8    0
+#     num_brushes  i32
+#     brushes[]    ...
+#     21 trailing section counts (all zero for a geometry-only group)
 #
-#  Each face (NO plane normal — Redux adds those, RED does not):
-#    tex_index(i32) surf_idx(i32 -1) face_id(i32) unk12(i32 -1)
-#    reserved1(u32 -1) portal_idx(i32 -1) face_flags(u16 0) reserved2(u16 0)
-#    smooth_groups(u32) room_idx(i32 -1) nfaceverts(i32)
-#    per vert: index(i32) + u(f32) + v(f32)
+#  PER BRUSH:
+#     uid          i32
+#     position     3f
+#     forward      3f   ← rotation rows in (fwd, right, up) order
+#     right        3f
+#     up           3f
+#
+#     ── geometry body (version >= 0xC8 layout) ──
+#     unk1         i32   0            ← these two ints replace the old
+#     unk2         i32   0            ← unk_mod field of pre-0xC8 files
+#     geo_name     VString ""
+#     num_tex      i32
+#     textures[]   VString
+#     num_scroll   i32   0            (face scroll table — empty)
+#     num_rooms    i32   0
+#     num_subroom  i32   0
+#     num_portals  i32   0
+#     num_verts    i32
+#     verts[]      3f
+#     num_faces    i32
+#     faces[]      see below
+#     num_surfaces i32   0
+#
+#     ── brush footer ──
+#     flags        u32
+#     life         i32
+#     state        i32
+#
+#  PER FACE (Redux RfgExporter writes the plane data — RED's parser
+#  expects it; the previous "RED doesn't include planes" note was wrong):
+#     plane_normal 3f
+#     plane_dist   f32
+#     tex_index    i32
+#     surf_idx     i32   -1
+#     face_id      i32
+#     unk12        i32   -1
+#     reserved1    u32   0xFFFFFFFF
+#     portal_idx   i32   -1
+#     face_flags   u16
+#     reserved2    u16   0
+#     smooth_grp   u32
+#     room_idx     i32   -1
+#     num_verts    i32
+#     per vert:    i32 index, f32 u, f32 v
 #
 # ─────────────────────────────────────────────────────────────────────────────
 
 RFG_MAGIC   = 0xD43DD00D
-RFG_VERSION = 98            # matches stock RED exports (shoplite01.rfg etc.)
+RFG_VERSION = 0x0000012C    # 300 — Alpine Faction RF1; matches Redux RfgExporter
 
-# 19 trailing section types that RED expects after brushes
-_RFG_TRAILING_SECTIONS = 19
+# 21 trailing section counts that RED expects after each group's brushes.
+# Each is read by the corresponding RflUtils.Skip*() call in Redux's RfgParser:
+#   geo_regions, lights, cutscene_cameras, cutscene_path_nodes, ambient_sounds,
+#   events, mp_respawn_points, nav_points, entities, items, clutters, triggers,
+#   particle_emitters, gas_regions, decals, climbing_regions, room_effects,
+#   eax_effects, bolt_emitters, targets, push_regions
+_RFG_TRAILING_SECTIONS = 21
+
 
 def _rfg_vstring(s):
     """Encode a VString: uint16 length + ASCII bytes (no null terminator)."""
@@ -1126,7 +1169,9 @@ def _rfg_collect_brushes(objects):
                     else:
                         face_uvs_local.append((0.0, 0.0))
 
-                # Reverse winding: bl_to_rf has det=-1, flips face orientation
+                # Reverse winding: bl_to_rf has det=-1, flips face orientation.
+                # After reversal, CCW (in RF) gives outward normals via the
+                # standard cross product b-a × c-a (computed below per face).
                 face_indices.reverse()
                 face_uvs_local.reverse()
 
@@ -1148,8 +1193,38 @@ def _rfg_collect_brushes(objects):
     return brushes
 
 
+def _rfg_face_plane(verts, indices):
+    """
+    Compute the plane (normal, dist) for a polygon defined by `indices` into
+    `verts` (list of (x,y,z) tuples). Uses the Newell-style accumulated cross
+    product to be robust on small/degenerate polys, then plane dist d such that
+    dot(n, p) + d = 0 for any p on the plane.
+
+    Matches Redux's RfgExporter.WriteBrushesSection plane computation.
+    """
+    if len(indices) < 3:
+        return (0.0, 0.0, 1.0, 0.0)
+    ax, ay, az = verts[indices[0]]
+    nx = ny = nz = 0.0
+    for i in range(1, len(indices) - 1):
+        bx, by, bz = verts[indices[i]]
+        cx, cy, cz = verts[indices[i + 1]]
+        ux, uy, uz = bx - ax, by - ay, bz - az
+        vx, vy, vz = cx - ax, cy - ay, cz - az
+        nx += uy * vz - uz * vy
+        ny += uz * vx - ux * vz
+        nz += ux * vy - uy * vx
+    length = math.sqrt(nx * nx + ny * ny + nz * nz)
+    if length < 1e-12:
+        return (0.0, 0.0, 1.0, 0.0)
+    nx /= length; ny /= length; nz /= length
+    dist = -(nx * ax + ny * ay + nz * az)
+    return (nx, ny, nz, dist)
+
+
 def _rfg_encode_brush(brush, uid):
-    """Encode a single brush to bytes in RED .rfg format."""
+    """Encode a single brush to bytes, matching Redux's on-disk layout for
+    version 0x12C (Alpine Faction RF1)."""
     buf = bytearray()
 
     # UID
@@ -1158,16 +1233,17 @@ def _rfg_encode_brush(brush, uid):
     # Position (3 floats)
     buf += struct.pack("<3f", *brush['position'])
 
-    # Rotation matrix 3×3 — RFG format is (forward, right, up) vectors
-    # Identity in RF space: fwd=(0,0,1), right=(1,0,0), up=(0,1,0)
-    buf += struct.pack("<9f", 0,0,1, 1,0,0, 0,1,0)
+    # Rotation matrix — written as (forward, right, up) row vectors.
+    # Identity in RF (Y-up, Z-fwd, X-right):
+    #   fwd=(0,0,1), right=(1,0,0), up=(0,1,0)
+    buf += struct.pack("<9f", 0, 0, 1,   1, 0, 0,   0, 1, 0)
 
-    # Geometry body
-    # VString geo_name (empty)
+    # ── Geometry body (version >= 0xC8 layout) ──
+    # 8 bytes of zero before the name (was 4-byte unk_mod in older versions)
+    buf += struct.pack("<II", 0, 0)
+
+    # Geo name (empty)
     buf += _rfg_vstring("")
-
-    # unk_mod (ver < 0xC8)
-    buf += struct.pack("<I", 0)
 
     # Textures
     textures = brush['textures']
@@ -1175,14 +1251,10 @@ def _rfg_encode_brush(brush, uid):
     for tex in textures:
         buf += _rfg_vstring(tex)
 
-    # Old unk scroll data (count = 0 for ver < 0xB4)
+    # Face scroll table (empty)
     buf += struct.pack("<i", 0)
-
-    # Rooms (count = 0)
-    buf += struct.pack("<i", 0)
-
-    # Portals (count = 0)
-    buf += struct.pack("<i", 0)
+    # Rooms / subroom links / portals (all empty)
+    buf += struct.pack("<iii", 0, 0, 0)
 
     # Vertices
     verts = brush['verts']
@@ -1190,10 +1262,18 @@ def _rfg_encode_brush(brush, uid):
     for x, y, z in verts:
         buf += struct.pack("<3f", x, y, z)
 
-    # Faces (NO plane normal in RED format!)
+    # Faces — each face has plane data BEFORE texture index (per Redux)
     faces = brush['faces']
     buf += struct.pack("<i", len(faces))
     for face in faces:
+        indices = face['indices']
+        uvs     = face['uvs']
+
+        # Plane: normal (3f) + dist (f32) — computed from the (already
+        # winding-reversed) indices so the normal points outward in RF space.
+        nx, ny, nz, dist = _rfg_face_plane(verts, indices)
+        buf += struct.pack("<4f", nx, ny, nz, dist)
+
         tex_index = 0                  # index into this brush's texture list
         surf_idx  = -1
         face_id   = face['face_id']
@@ -1202,7 +1282,7 @@ def _rfg_encode_brush(brush, uid):
         portal    = -1
         fflags    = 0                  # uint16
         reserved2 = 0                  # uint16
-        smooth    = 0                  # smoothing groups
+        smooth    = 0                  # smoothing groups (uint32)
         room      = -1
 
         buf += struct.pack("<i", tex_index)
@@ -1216,17 +1296,13 @@ def _rfg_encode_brush(brush, uid):
         buf += struct.pack("<I", smooth)
         buf += struct.pack("<i", room)
 
-        indices = face['indices']
-        uvs     = face['uvs']
         buf += struct.pack("<i", len(indices))
         for vi_idx, (u, v) in zip(indices, uvs):
             buf += struct.pack("<i", vi_idx)
             buf += struct.pack("<2f", u, v)
 
-    # Surfaces (count = 0)
-    buf += struct.pack("<i", 0)
-
-    # Old face scroll (count = 0, ver <= 0xB4)
+    # Surfaces (count = 0). For version > 0xB4 there's NO old-face-scroll
+    # block after this, so brush footer follows immediately.
     buf += struct.pack("<i", 0)
 
     # Brush flags, life, state
@@ -1241,7 +1317,7 @@ def _write_rfg(filepath, objects, group_name=""):
     """
     Write a .rfg group file from Blender mesh objects.
     Each material on each object becomes one brush.
-    Format matches stock RED editor exports (ver 98).
+    Format matches Redux's RfgExporter output (RF1 version 0x12C / 300).
     """
     if not group_name:
         group_name = os.path.splitext(os.path.basename(filepath))[0]
@@ -1252,21 +1328,22 @@ def _write_rfg(filepath, objects, group_name=""):
 
     buf = bytearray()
 
-    # File header
+    # ── File header ──
     buf += struct.pack("<I", RFG_MAGIC)
     buf += struct.pack("<i", RFG_VERSION)
+    buf += struct.pack("<i", 1)         # num_groups = 1
 
-    # Group header
+    # ── Group header ──
     buf += _rfg_vstring(group_name)
     buf += struct.pack("<B", 0)         # is_moving = false
 
-    # Brushes
+    # ── Brushes ──
     buf += struct.pack("<i", len(brushes))
     for i, brush in enumerate(brushes):
         uid = i + 1                     # UIDs start at 1
         buf += _rfg_encode_brush(brush, uid)
 
-    # 19 trailing section counts (all zero)
+    # ── 21 trailing section counts (all zero — geometry-only group) ──
     for _ in range(_RFG_TRAILING_SECTIONS):
         buf += struct.pack("<i", 0)
 
